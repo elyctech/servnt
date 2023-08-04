@@ -1,0 +1,7 @@
+[app]
+name = "servnt_hello_world"
+version = "0.1.0"
+
+[paths.mapped]
+"/favicon.ico" = "../common/favicon/favicon.ico"
+"/favicon" = "../common/favicon"
