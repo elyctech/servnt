@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env,
     error::Error,
-    fs, io,
+    fmt, fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,6 +20,8 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 struct ServntFile {
     app: AppInfo,
+    #[serde(default = "HashMap::new")]
+    extensions: HashMap<String, String>,
     paths: AppPaths,
 }
 
@@ -42,14 +44,53 @@ impl AppPaths {
     }
 }
 
+fn default_extension_content_types() -> HashMap<String, String> {
+    [
+        ("html", "text/html"),
+        ("png", "image/png"),
+        ("ico", "image/vnd.microsoft.icon"),
+        ("webmanifest", "application/manifest+json"),
+    ]
+    .map(|(extension, content_type)| (extension.to_string(), content_type.to_string()))
+    .into()
+}
+
+enum FileError {
+    IoError(io::Error),
+    UnknownExtension,
+}
+
+impl From<io::Error> for FileError {
+    fn from(error: io::Error) -> Self {
+        FileError::IoError(error)
+    }
+}
+
+impl fmt::Display for FileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FileError::IoError(io_error) => io_error.fmt(f),
+            FileError::UnknownExtension => f.write_str("unknown extension"),
+        }
+    }
+}
+
 struct ServntState {
+    extension_content_types: HashMap<String, String>,
     full_base_path: PathBuf,
     mapped_paths: HashMap<String, PathBuf>,
 }
 
 impl ServntState {
     fn new(cwd: &PathBuf, servnt_file: ServntFile) -> Result<ServntState, io::Error> {
+        let mut extension_content_types = default_extension_content_types();
+
+        for (extension, content_type) in servnt_file.extensions {
+            extension_content_types.insert(extension, content_type);
+        }
+
         let full_base_path = cwd.join(&servnt_file.paths.base).canonicalize()?;
+
         let mut mapped_paths = HashMap::with_capacity(servnt_file.paths.mapped.len());
 
         for (matched, mapped) in servnt_file.paths.mapped {
@@ -57,9 +98,26 @@ impl ServntState {
         }
 
         Ok(ServntState {
+            extension_content_types,
             full_base_path,
             mapped_paths,
         })
+    }
+
+    fn get_content_type<P>(&self, path: P) -> Result<String, FileError>
+    where
+        P: AsRef<Path>,
+    {
+        self.extension_content_types
+            .get(
+                path.as_ref()
+                    .extension()
+                    .map_or(Err(FileError::UnknownExtension), |extension| {
+                        extension.to_str().ok_or(FileError::UnknownExtension)
+                    })?,
+            )
+            .ok_or(FileError::UnknownExtension)
+            .cloned()
     }
 
     fn resolve_path<P>(&self, path: P) -> Result<PathBuf, io::Error>
@@ -69,10 +127,7 @@ impl ServntState {
         let match_path = Path::new("/").join(&path);
         let mut final_path = None;
 
-        println!("Looking for '{}'", match_path.display());
-
         for (matched, mapped) in &self.mapped_paths {
-            println!("checking for match with '{}'", matched);
             if let Ok(stripped_path) = match_path.strip_prefix(matched) {
                 if stripped_path == Path::new("") {
                     final_path = Some(mapped.clone());
@@ -83,15 +138,6 @@ impl ServntState {
                 break;
             }
         }
-
-        println!(
-            "{} => '{}'",
-            path.as_ref().display(),
-            final_path
-                .clone()
-                .unwrap_or(self.full_base_path.join(&path).join("!"))
-                .display()
-        );
 
         final_path
             .unwrap_or_else(|| self.full_base_path.join(&path))
@@ -112,8 +158,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = Arc::new(ServntState::new(&cwd, servnt_file)?);
 
     let app = Router::new()
-        .route("/", get(get_index))
-        .route("/:desired", get(get_path))
+        .route("/", get(get_root_index))
+        .route("/*desired", get(get_path))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 19518));
@@ -125,21 +171,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn get_file(state: &ServntState, path: &str) -> impl IntoResponse {
-    match state.resolve_path(path) {
-        Ok(index_path) => (
-            StatusCode::OK,
-            format!("You wanted '{}'", index_path.display()),
-        ),
-        Err(error) => {
+async fn get_file(state: &ServntState, path: &str) -> Result<impl IntoResponse, impl IntoResponse> {
+    state
+        .resolve_path(path)
+        .map_err(FileError::IoError)
+        .and_then(|file_path| {
+            Ok(state
+                .get_content_type(&file_path)
+                .map(|content_type| (content_type, file_path))?)
+        })
+        .and_then(|(content_type, file_path)| {
+            Ok(([("Content-Type", content_type)], fs::read(file_path)?))
+        })
+        .or_else(|error| {
             eprintln!("{error}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "".to_string())
-        }
-    }
-}
-
-async fn get_index(State(state): State<Arc<ServntState>>) -> impl IntoResponse {
-    get_file(&state, "index.html").await
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        })
 }
 
 async fn get_path(
@@ -147,4 +194,8 @@ async fn get_path(
     State(state): State<Arc<ServntState>>,
 ) -> impl IntoResponse {
     get_file(&state, &desired_path).await
+}
+
+async fn get_root_index(State(state): State<Arc<ServntState>>) -> impl IntoResponse {
+    get_file(&state, "index.html").await
 }
